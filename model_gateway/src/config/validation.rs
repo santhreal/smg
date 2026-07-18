@@ -18,6 +18,93 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
     Ok(())
 }
 
+/// Validates a shared `api_key` plus per-tenant credentials: non-empty
+/// `tenant_id`/`key` with no surrounding whitespace, and no two credentials
+/// (including `api_key`) sharing a secret value — a collision would silently
+/// attribute one tenant's traffic to another, since duplicate-value keys
+/// resolve to whichever entry is inserted last.
+///
+/// This is `pub(crate)` rather than folded into `ConfigValidator` because
+/// it's also the validation `AuthConfig::with_tenant_keys` runs directly —
+/// that's the true chokepoint every construction path (CLI, Python
+/// bindings, a `RouterConfig` built or deserialized directly by a Rust
+/// library caller, or a hand-built `AuthConfig` passed straight into
+/// `server::build_app`) funnels through, since `AuthConfig`'s internal map
+/// is private and can only be populated this way. Validating one layer up,
+/// on `&RouterConfig` alone, is bypassable by any of those paths that skip
+/// `RouterConfigBuilder::build()`.
+///
+/// Compares hashes only; errors never include a raw key value.
+pub(crate) fn validate_tenant_credentials(
+    api_key: Option<&str>,
+    tenant_api_keys: &[TenantApiKeyEntry],
+) -> ConfigResult<()> {
+    fn hash(key: &str) -> [u8; 32] {
+        Sha256::digest(key.as_bytes()).into()
+    }
+
+    let mut seen: std::collections::HashMap<[u8; 32], String> = std::collections::HashMap::new();
+
+    if let Some(api_key) = api_key {
+        seen.insert(hash(api_key), "the shared api_key".to_string());
+    }
+
+    for entry in tenant_api_keys {
+        let trimmed_tenant_id = entry.tenant_id.trim();
+        if trimmed_tenant_id.is_empty() {
+            return Err(ConfigError::ValidationFailed {
+                reason: "tenant_api_keys entries must have a non-empty tenant_id".to_string(),
+            });
+        }
+        // The CLI parser already trims tenant_id, but config-file/binding
+        // entries bypass it — reject padding here instead of silently
+        // normalizing, since `auth:<tenant_id>` embeds it verbatim and a
+        // padded id would resolve to a different, likely-unintended
+        // tenant identity than the canonical one.
+        if trimmed_tenant_id != entry.tenant_id {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "tenant_api_keys tenant_id '{}' must not have surrounding whitespace",
+                    entry.tenant_id
+                ),
+            });
+        }
+        let trimmed_key = entry.key.trim();
+        if trimmed_key.is_empty() {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "tenant_api_keys entry for tenant_id '{}' must have a non-empty key",
+                    entry.tenant_id
+                ),
+            });
+        }
+        // Same asymmetry as tenant_id: the CLI trims the key, but
+        // config-file/binding entries don't go through it. A padded key
+        // would hash differently than the operator likely intended,
+        // silently defeating the duplicate-value check above for that
+        // entry.
+        if trimmed_key != entry.key {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "tenant_api_keys entry for tenant_id '{}' key must not have surrounding whitespace",
+                    entry.tenant_id
+                ),
+            });
+        }
+
+        let label = format!("tenant_id '{}'", entry.tenant_id);
+        if let Some(existing) = seen.insert(hash(&entry.key), label.clone()) {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "duplicate API key value: {label} uses the same credential as {existing}. Each credential must be unique, or requests authenticate as whichever entry is checked last."
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 
@@ -114,78 +201,10 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validates `tenant_api_keys`: non-empty `tenant_id`/`key`, and no two
-    /// credentials (including the shared `api_key`) sharing a secret value —
-    /// duplicates would silently attribute one tenant's traffic to another.
-    /// Runs regardless of construction path, since `TenantApiKeyEntry` is a
-    /// public deserializable struct. Compares hashes only; errors never
-    /// include a raw key value.
+    /// See [`validate_tenant_credentials`] — this just supplies the two
+    /// fields from a `RouterConfig`.
     fn validate_tenant_api_keys(config: &RouterConfig) -> ConfigResult<()> {
-        fn hash(key: &str) -> [u8; 32] {
-            Sha256::digest(key.as_bytes()).into()
-        }
-
-        let mut seen: std::collections::HashMap<[u8; 32], String> =
-            std::collections::HashMap::new();
-
-        if let Some(api_key) = &config.api_key {
-            seen.insert(hash(api_key), "the shared api_key".to_string());
-        }
-
-        for entry in &config.tenant_api_keys {
-            let trimmed_tenant_id = entry.tenant_id.trim();
-            if trimmed_tenant_id.is_empty() {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "tenant_api_keys entries must have a non-empty tenant_id".to_string(),
-                });
-            }
-            // The CLI parser already trims tenant_id, but config-file/binding
-            // entries bypass it — reject padding here instead of silently
-            // normalizing, since `auth:<tenant_id>` embeds it verbatim and a
-            // padded id would resolve to a different, likely-unintended
-            // tenant identity than the canonical one.
-            if trimmed_tenant_id != entry.tenant_id {
-                return Err(ConfigError::ValidationFailed {
-                    reason: format!(
-                        "tenant_api_keys tenant_id '{}' must not have surrounding whitespace",
-                        entry.tenant_id
-                    ),
-                });
-            }
-            let trimmed_key = entry.key.trim();
-            if trimmed_key.is_empty() {
-                return Err(ConfigError::ValidationFailed {
-                    reason: format!(
-                        "tenant_api_keys entry for tenant_id '{}' must have a non-empty key",
-                        entry.tenant_id
-                    ),
-                });
-            }
-            // Same asymmetry as tenant_id: the CLI trims the key, but
-            // config-file/binding entries don't go through it. A padded key
-            // would hash differently than the operator likely intended,
-            // silently defeating the duplicate-value check above for that
-            // entry.
-            if trimmed_key != entry.key {
-                return Err(ConfigError::ValidationFailed {
-                    reason: format!(
-                        "tenant_api_keys entry for tenant_id '{}' key must not have surrounding whitespace",
-                        entry.tenant_id
-                    ),
-                });
-            }
-
-            let label = format!("tenant_id '{}'", entry.tenant_id);
-            if let Some(existing) = seen.insert(hash(&entry.key), label.clone()) {
-                return Err(ConfigError::ValidationFailed {
-                    reason: format!(
-                        "duplicate API key value: {label} uses the same credential as {existing}. Each credential must be unique, or requests authenticate as whichever entry is checked last."
-                    ),
-                });
-            }
-        }
-
-        Ok(())
+        validate_tenant_credentials(config.api_key.as_deref(), &config.tenant_api_keys)
     }
 
     fn validate_oracle(oracle: &OracleConfig) -> ConfigResult<()> {

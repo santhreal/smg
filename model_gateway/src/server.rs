@@ -1381,7 +1381,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let serving_auth_config = AuthConfig::with_tenant_keys(
         config.router_config.api_key.clone(),
         &config.router_config.tenant_api_keys,
-    );
+    )?;
     let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
     // Initialize control plane authentication if configured

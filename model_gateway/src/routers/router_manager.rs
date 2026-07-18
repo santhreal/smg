@@ -108,7 +108,8 @@ impl RouterManager {
         manager.gateway_auth = AuthConfig::with_tenant_keys(
             config.router_config.api_key.clone(),
             &config.router_config.tenant_api_keys,
-        );
+        )
+        .map_err(|e| e.to_string())?;
         let manager = Arc::new(manager);
 
         if config.router_config.enable_igw {
@@ -1047,7 +1048,8 @@ mod tests {
                 tenant_id: "team-red".to_string(),
                 key: "team-red-secret".to_string(),
             }],
-        );
+        )
+        .unwrap();
 
         let req = Request::builder()
             .method("GET")

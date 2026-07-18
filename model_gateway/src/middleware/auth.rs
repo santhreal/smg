@@ -17,7 +17,7 @@ use axum::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::TenantApiKeyEntry,
+    config::{validation::validate_tenant_credentials, ConfigResult, TenantApiKeyEntry},
     tenant::{authenticated_tenant_key_from_sha256, DataPlaneCaller, TenantIdentity, TenantKey},
 };
 
@@ -29,16 +29,39 @@ pub struct AuthConfig {
 impl AuthConfig {
     /// Single shared key; every caller resolves to the same hash-derived
     /// identity. Use [`Self::with_tenant_keys`] for per-tenant separation.
+    /// Infallible: with no tenant entries, [`validate_tenant_credentials`]
+    /// can't find a duplicate or malformed one.
     pub fn new(api_key: Option<String>) -> Self {
-        Self::with_tenant_keys(api_key, &[])
+        Self {
+            keys: Self::build_keys(api_key, &[]),
+        }
     }
 
     /// `tenant_api_keys` adds per-tenant keys on top of `api_key`, each
     /// resolving to its own `auth:<tenant_id>` identity.
+    ///
+    /// Validates before building: this is the true chokepoint every
+    /// construction path funnels through (CLI, Python bindings, a
+    /// `RouterConfig` a Rust library caller built or deserialized directly,
+    /// or an `AuthConfig` built by hand and passed into
+    /// `server::build_app`), since `keys` is private and there's no other
+    /// way to populate it. Validating one layer up, on `&RouterConfig`
+    /// alone, is bypassable by any caller that skips
+    /// `RouterConfigBuilder::build()`.
     pub fn with_tenant_keys(
         api_key: Option<String>,
         tenant_api_keys: &[TenantApiKeyEntry],
-    ) -> Self {
+    ) -> ConfigResult<Self> {
+        validate_tenant_credentials(api_key.as_deref(), tenant_api_keys)?;
+        Ok(Self {
+            keys: Self::build_keys(api_key, tenant_api_keys),
+        })
+    }
+
+    fn build_keys(
+        api_key: Option<String>,
+        tenant_api_keys: &[TenantApiKeyEntry],
+    ) -> HashMap<[u8; 32], TenantKey> {
         let mut keys = HashMap::with_capacity(tenant_api_keys.len() + 1);
 
         if let Some(key) = api_key {
@@ -53,7 +76,7 @@ impl AuthConfig {
             );
         }
 
-        Self { keys }
+        keys
     }
 
     /// Whether any key is configured. Empty means [`auth_middleware`]
@@ -186,7 +209,8 @@ mod tests {
                 tenant_id: "team-red".to_string(),
                 key: "team-red-secret".to_string(),
             }],
-        );
+        )
+        .unwrap();
 
         let response = app(auth_config)
             .oneshot(
@@ -217,7 +241,8 @@ mod tests {
                     key: "blue-secret".to_string(),
                 },
             ],
-        );
+        )
+        .unwrap();
 
         for (key, expected_tenant) in [
             ("red-secret", "auth:team-red"),
@@ -247,7 +272,8 @@ mod tests {
                 tenant_id: "team-red".to_string(),
                 key: "team-red-secret".to_string(),
             }],
-        );
+        )
+        .unwrap();
 
         let response = app(auth_config)
             .oneshot(
@@ -283,10 +309,57 @@ mod tests {
                 tenant_id: "team-red".to_string(),
                 key: "team-red-secret".to_string(),
             }],
-        );
+        )
+        .unwrap();
 
         assert!(auth_config.contains_token("shared-secret"));
         assert!(auth_config.contains_token("team-red-secret"));
         assert!(!auth_config.contains_token("not-a-configured-key"));
+    }
+
+    /// Regression test for a reviewer-flagged gap: `server::build_app` takes
+    /// an already-built `AuthConfig`, not a `RouterConfig`, so it has no raw
+    /// data left to validate even if it wanted to. A caller who builds their
+    /// own `AuthConfig` (e.g. embedding the gateway as a library and calling
+    /// `build_app` directly, skipping both `RouterConfigBuilder::build()`
+    /// and `server::startup`) must be validated right here, since this is
+    /// the only place that ever sees the raw fields before they're hashed
+    /// away into the private `keys` map.
+    #[test]
+    fn with_tenant_keys_rejects_empty_key_even_with_no_router_config_involved() {
+        let result = AuthConfig::with_tenant_keys(
+            None,
+            &[TenantApiKeyEntry {
+                tenant_id: "team-a".to_string(),
+                key: String::new(),
+            }],
+        );
+
+        assert!(
+            result.is_err(),
+            "an empty key must not silently become a valid credential"
+        );
+    }
+
+    #[test]
+    fn with_tenant_keys_rejects_duplicate_credential_even_with_no_router_config_involved() {
+        let result = AuthConfig::with_tenant_keys(
+            None,
+            &[
+                TenantApiKeyEntry {
+                    tenant_id: "team-a".to_string(),
+                    key: "shared-secret".to_string(),
+                },
+                TenantApiKeyEntry {
+                    tenant_id: "team-b".to_string(),
+                    key: "shared-secret".to_string(),
+                },
+            ],
+        );
+
+        assert!(
+            result.is_err(),
+            "two entries sharing a credential must not silently collapse to one identity"
+        );
     }
 }

@@ -119,10 +119,15 @@ pub fn create_test_app(
         ]
     });
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper assumes router config is already validated"
+    )]
     let serving_auth_config = AuthConfig::with_tenant_keys(
         router_config.api_key.clone(),
         &router_config.tenant_api_keys,
-    );
+    )
+    .expect("valid tenant_api_keys");
     let admin_auth_config = AuthConfig::new(router_config.api_key.clone());
 
     // Use the actual server's build_app function
@@ -187,10 +192,15 @@ pub fn create_test_app_with_context(
         ]
     });
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper assumes router config is already validated"
+    )]
     let serving_auth_config = AuthConfig::with_tenant_keys(
         router_config.api_key.clone(),
         &router_config.tenant_api_keys,
-    );
+    )
+    .expect("valid tenant_api_keys");
     let admin_auth_config = AuthConfig::new(router_config.api_key.clone());
 
     // Use the actual server's build_app function
