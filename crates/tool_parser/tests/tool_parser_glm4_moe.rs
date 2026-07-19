@@ -166,6 +166,22 @@ async fn test_glm4_arg_value_close_tag_inside_value() {
 }
 
 #[tokio::test]
+async fn test_glm4_arg_value_with_literal_arg_key_tag() {
+    let parser = Glm4MoeParser::glm45();
+    let input = r"<tool_call>echo
+<arg_key>text</arg_key>
+<arg_value>see <arg_key> docs</arg_value>
+<arg_key>n</arg_key>
+<arg_value>2</arg_value>
+</tool_call>";
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["text"], "see <arg_key> docs");
+    assert_eq!(args["n"], 2);
+}
+
+#[tokio::test]
 async fn test_glm4_nested_json_in_arg_values() {
     let parser = Glm4MoeParser::glm45();
 
@@ -182,4 +198,18 @@ async fn test_glm4_nested_json_in_arg_values() {
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert!(args["data"].is_object());
     assert!(args["list"].is_array());
+}
+
+#[tokio::test]
+async fn test_glm4_arg_value_containing_close_tag_literal() {
+    let parser = Glm4MoeParser::glm45();
+    let input = r#"<tool_call>echo
+<arg_key>text</arg_key>
+<arg_value>before </arg_value> after</arg_value>
+</tool_call>"#;
+    let (_normal, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "echo");
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["text"], "before </arg_value> after");
 }

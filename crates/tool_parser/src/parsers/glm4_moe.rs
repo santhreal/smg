@@ -92,7 +92,6 @@ impl Glm4MoeParser {
         param_types: &HashMap<String, String>,
     ) -> serde_json::Map<String, Value> {
         let mut arguments = serde_json::Map::new();
-        // Prefer last </arg_value> before next <arg_key> so literals inside values survive.
         let mut rest = args_text;
         while let Some(key_rel) = rest.find("<arg_key>") {
             rest = &rest[key_rel + "<arg_key>".len()..];
@@ -106,12 +105,10 @@ impl Glm4MoeParser {
                 continue;
             }
             rest = &trimmed["<arg_value>".len()..];
-            let next_key = rest.find("<arg_key>").unwrap_or(rest.len());
-            let search = &rest[..next_key];
-            let Some(close_rel) = search.rfind("</arg_value>") else {
+            let Some(close_rel) = Self::find_arg_value_close(rest) else {
                 break;
             };
-            let value_str = search[..close_rel].trim();
+            let value_str = rest[..close_rel].trim();
             let value = helpers::coerce_by_schema_type(
                 value_str,
                 param_types.get(key).map(String::as_str),
@@ -122,6 +119,35 @@ impl Glm4MoeParser {
         }
 
         arguments
+    }
+
+    /// First `</arg_value>` whose follower is end-of-args or a real next key pair.
+    fn find_arg_value_close(value_and_rest: &str) -> Option<usize> {
+        let needle = "</arg_value>";
+        let mut from = 0;
+        while let Some(rel) = value_and_rest[from..].find(needle) {
+            let abs = from + rel;
+            let after = &value_and_rest[abs + needle.len()..];
+            if after.trim_start().is_empty() || Self::follows_with_real_arg_key(after) {
+                return Some(abs);
+            }
+            from = abs + needle.len();
+        }
+        None
+    }
+
+    fn follows_with_real_arg_key(after: &str) -> bool {
+        let trimmed = after.trim_start();
+        if !trimmed.starts_with("<arg_key>") {
+            return false;
+        }
+        let rest = &trimmed["<arg_key>".len()..];
+        let Some(key_end) = rest.find("</arg_key>") else {
+            return false;
+        };
+        rest[key_end + "</arg_key>".len()..]
+            .trim_start()
+            .starts_with("<arg_value>")
     }
 
     /// Parse a single tool call block
