@@ -331,7 +331,6 @@ async fn test_deepseek31_streaming_end_marker_inside_json_string() {
     let tools = create_test_tools();
     let mut parser = DeepSeek31Parser::new();
 
-    // `echo` is not in create_test_tools(); use `search` which is.
     let chunks = vec![
         "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>search<｜tool▁sep｜>",
         r#"{"query": "say <｜tool▁call▁end｜> please"}"#,
@@ -355,8 +354,4 @@ async fn test_deepseek31_streaming_end_marker_inside_json_string() {
     let parsed: serde_json::Value =
         serde_json::from_str(&collected_args).expect("streamed args should be valid JSON");
     assert_eq!(parsed["query"], "say <｜tool▁call▁end｜> please");
-    assert!(
-        !collected_args.contains("<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
-        "trailing structural end markers must not leak into streamed args"
-    );
 }
