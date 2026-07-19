@@ -2,7 +2,6 @@ use std::{collections::HashMap, fmt::Write as FmtWrite};
 
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
-use regex::Regex;
 use serde_json::Value;
 
 use crate::{
@@ -11,6 +10,11 @@ use crate::{
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
+
+const TOOL_CALL_OPEN: &str = "<minimax:tool_call>";
+const TOOL_CALL_CLOSE: &str = "</minimax:tool_call>";
+const INVOKE_CLOSE: &str = "</invoke>";
+const PARAM_CLOSE: &str = "</parameter>";
 
 /// MiniMax M2 format parser for tool calls
 ///
@@ -23,13 +27,11 @@ use crate::{
 /// - Parameters as `<parameter name="key">value</parameter>`
 /// - Incremental JSON streaming for parameters
 ///
+/// Literal close tags inside parameter values are kept by matching each closer
+/// against the next sibling open (`<parameter` / `<invoke` / wrapper end).
+///
 /// Reference: https://huggingface.co/MiniMaxAI/MiniMax-M2?chat_template=default
 pub struct MinimaxM2Parser {
-    // Regex patterns
-    tool_call_extractor: Regex,
-    invoke_extractor: Regex,
-    param_extractor: Regex,
-
     // Streaming state
     buffer: String,
     prev_tool_call_arr: Vec<Value>,
@@ -74,25 +76,8 @@ impl MinimaxM2Parser {
     }
 
     /// Create a new MiniMax M2 parser
-    #[expect(
-        clippy::expect_used,
-        reason = "regex patterns are compile-time string literals"
-    )]
     pub fn new() -> Self {
-        // Use (?s) flag for DOTALL mode to handle newlines
-        let tool_call_pattern = r"(?s)<minimax:tool_call>.*?</minimax:tool_call>";
-        let tool_call_extractor = Regex::new(tool_call_pattern).expect("Valid regex pattern");
-
-        let invoke_pattern = r#"(?s)<invoke\s+name="([^"]+)">(.*?)</invoke>"#;
-        let invoke_extractor = Regex::new(invoke_pattern).expect("Valid regex pattern");
-
-        let param_pattern = r#"(?s)<parameter\s+name="([^"]+)">(.*?)</parameter>"#;
-        let param_extractor = Regex::new(param_pattern).expect("Valid regex pattern");
-
         Self {
-            tool_call_extractor,
-            invoke_extractor,
-            param_extractor,
             buffer: String::new(),
             prev_tool_call_arr: Vec::new(),
             current_tool_id: -1,
@@ -101,33 +86,29 @@ impl MinimaxM2Parser {
             current_parameters: HashMap::new(),
             in_tool_call: false,
             function_name_sent: false,
-            tool_call_start_token: "<minimax:tool_call>",
-            tool_call_end_token: "</minimax:tool_call>",
-            invoke_end_token: "</invoke>",
+            tool_call_start_token: TOOL_CALL_OPEN,
+            tool_call_end_token: TOOL_CALL_CLOSE,
+            invoke_end_token: INVOKE_CLOSE,
         }
     }
 
     /// Parse parameter tags, coercing each value by its declared schema type when
     /// known (so a numeric-looking `string` stays a string), else inferring.
     fn parse_parameters(
-        &self,
         params_text: &str,
         param_types: &HashMap<String, String>,
     ) -> serde_json::Map<String, Value> {
         let mut parameters = serde_json::Map::new();
 
-        for capture in self.param_extractor.captures_iter(params_text) {
-            let key = capture.get(1).map_or("", |m| m.as_str()).trim();
-            let value_str = capture.get(2).map_or("", |m| m.as_str());
-
-            let decoded_value = Self::decode_xml_entities(value_str);
+        for (key, value_str) in parse_parameter_pairs(params_text) {
+            let decoded_value = Self::decode_xml_entities(&value_str);
             let value = helpers::coerce_by_schema_type(
                 &decoded_value,
-                param_types.get(key).map(String::as_str),
+                param_types.get(&key).map(String::as_str),
             )
             .unwrap_or_else(|| Self::parse_value(&decoded_value));
 
-            parameters.insert(key.to_string(), value);
+            parameters.insert(key, value);
         }
 
         parameters
@@ -147,23 +128,16 @@ impl MinimaxM2Parser {
     /// MiniMax M2 emits parallel calls as multiple `<invoke>` blocks inside a single
     /// `<minimax:tool_call>` wrapper (Anthropic-style), so we iterate all matches —
     /// a single capture would drop every call after the first.
-    fn parse_tool_call(&self, block: &str, tools: &[Tool]) -> Vec<ToolCall> {
+    fn parse_tool_call(block: &str, tools: &[Tool]) -> Vec<ToolCall> {
         let mut calls = Vec::new();
-        for captures in self.invoke_extractor.captures_iter(block) {
-            // Get function name from invoke tag attribute
-            let func_name = captures.get(1).map_or("", |m| m.as_str()).trim();
-
-            // Get parameters text
-            let params_text = captures.get(2).map_or("", |m| m.as_str());
-
-            // Parse parameters, coerced by this function's declared schema.
-            let param_types = helpers::param_types_for_function(tools, func_name);
-            let parameters = self.parse_parameters(params_text, &param_types);
+        for (func_name, params_text) in iter_invoke_blocks(block) {
+            let param_types = helpers::param_types_for_function(tools, &func_name);
+            let parameters = Self::parse_parameters(params_text, &param_types);
 
             match serde_json::to_string(&parameters) {
                 Ok(arguments_str) => calls.push(ToolCall {
                     function: FunctionCall {
-                        name: func_name.to_string(),
+                        name: func_name,
                         arguments: arguments_str,
                     },
                 }),
@@ -174,18 +148,14 @@ impl MinimaxM2Parser {
     }
 
     /// Parse all tool calls from text and return first valid position
-    fn parse_tool_calls_from_text(
-        &self,
-        text: &str,
-        tools: &[Tool],
-    ) -> (Vec<ToolCall>, Option<usize>) {
+    fn parse_tool_calls_from_text(text: &str, tools: &[Tool]) -> (Vec<ToolCall>, Option<usize>) {
         let mut tool_calls = Vec::new();
         let mut first_valid_pos = None;
 
-        for mat in self.tool_call_extractor.find_iter(text) {
-            let calls = self.parse_tool_call(mat.as_str(), tools);
+        for (start, block) in iter_tool_call_blocks(text) {
+            let calls = Self::parse_tool_call(block, tools);
             if !calls.is_empty() && first_valid_pos.is_none() {
-                first_valid_pos = Some(mat.start());
+                first_valid_pos = Some(start);
             }
             tool_calls.extend(calls);
         }
@@ -198,7 +168,7 @@ impl MinimaxM2Parser {
         if !self.has_tool_markers(text) {
             return (text.to_string(), vec![]);
         }
-        let (tool_calls, first_valid_tool_pos) = self.parse_tool_calls_from_text(text, tools);
+        let (tool_calls, first_valid_tool_pos) = Self::parse_tool_calls_from_text(text, tools);
         if tool_calls.is_empty() {
             return (text.to_string(), vec![]);
         }
@@ -214,17 +184,11 @@ impl MinimaxM2Parser {
         let mut calls = Vec::new();
         let param_types = helpers::param_types_for_function(tools, &self.current_function_name);
 
-        // Find all complete parameter patterns in the buffer
-        let param_matches: Vec<_> = self
-            .param_extractor
-            .captures_iter(text)
-            .map(|cap| {
-                let name = cap.get(1).map_or("", |m| m.as_str()).trim().to_string();
-                let value_str = cap.get(2).map_or("", |m| m.as_str());
-                let decoded = Self::decode_xml_entities(value_str);
+        let param_matches: Vec<_> = parse_parameter_pairs(text)
+            .into_iter()
+            .map(|(name, value_str)| {
+                let decoded = Self::decode_xml_entities(&value_str);
 
-                // Coerce by declared type when known; otherwise keep the prior
-                // JSON-first-then-infer behavior for nested objects/arrays.
                 let value = helpers::coerce_by_schema_type(
                     &decoded,
                     param_types.get(&name).map(String::as_str),
@@ -327,6 +291,165 @@ impl MinimaxM2Parser {
     }
 }
 
+/// Find `<tag ... name="...">` and return (name, absolute end index past `>`).
+fn find_named_open(s: &str, tag: &str) -> Option<(String, usize)> {
+    let open = format!("<{tag}");
+    let mut search = 0;
+    while let Some(rel) = s[search..].find(&open) {
+        let abs = search + rel;
+        let after_tag = &s[abs + open.len()..];
+        if after_tag
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && c != '>')
+        {
+            search = abs + 1;
+            continue;
+        }
+        // Only inspect attributes inside this open tag (before `>`).
+        let Some(gt_rel) = after_tag.find('>') else {
+            search = abs + 1;
+            continue;
+        };
+        let attrs = &after_tag[..gt_rel];
+        let Some(name_rel) = attrs.find("name=\"") else {
+            search = abs + 1;
+            continue;
+        };
+        let name_start = name_rel + "name=\"".len();
+        let name_rest = &attrs[name_start..];
+        let Some(name_end) = name_rest.find('"') else {
+            search = abs + 1;
+            continue;
+        };
+        let name = name_rest[..name_end].to_string();
+        let end = abs + open.len() + gt_rel + 1;
+        return Some((name, end));
+    }
+    None
+}
+
+fn parse_parameter_pairs(params_text: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut cursor = params_text;
+
+    while let Some((key, value_start)) = find_named_open(cursor, "parameter") {
+        let after_open = &cursor[value_start..];
+        let next_param = find_parameter_open_offset(after_open).unwrap_or(after_open.len());
+        let region = &after_open[..next_param];
+        let Some(close_rel) = region.rfind(PARAM_CLOSE) else {
+            break;
+        };
+        let value = region[..close_rel].to_string();
+        pairs.push((key, value));
+        cursor = &after_open[close_rel + PARAM_CLOSE.len()..];
+    }
+
+    pairs
+}
+
+fn find_parameter_open_offset(s: &str) -> Option<usize> {
+    let open = "<parameter";
+    let mut search = 0;
+    while let Some(rel) = s[search..].find(open) {
+        let abs = search + rel;
+        if find_named_open(&s[abs..], "parameter").is_some() {
+            return Some(abs);
+        }
+        search = abs + 1;
+    }
+    None
+}
+
+fn parameters_fully_closed(params_text: &str) -> bool {
+    let mut cursor = params_text;
+    while let Some((_key, value_start)) = find_named_open(cursor, "parameter") {
+        let after_open = &cursor[value_start..];
+        let next_param = find_parameter_open_offset(after_open).unwrap_or(after_open.len());
+        let region = &after_open[..next_param];
+        let Some(close_rel) = region.rfind(PARAM_CLOSE) else {
+            return false;
+        };
+        cursor = &after_open[close_rel + PARAM_CLOSE.len()..];
+    }
+    find_parameter_open_offset(cursor).is_none()
+}
+
+fn find_structural_close(haystack: &str, close: &str, params_prefix_ok: impl Fn(&str) -> bool) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(close) {
+        let abs = from + rel;
+        if params_prefix_ok(&haystack[..abs]) {
+            return Some(abs);
+        }
+        from = abs + close.len();
+    }
+    None
+}
+
+fn iter_invoke_blocks(block: &str) -> Vec<(String, &str)> {
+    let mut out = Vec::new();
+    let mut cursor = block;
+
+    while let Some((name, value_start)) = find_named_open(cursor, "invoke") {
+        let after_open = &cursor[value_start..];
+        let next_invoke = find_invoke_open_offset(after_open).unwrap_or(after_open.len());
+        let region = &after_open[..next_invoke];
+        let Some(close_rel) = find_structural_close(region, INVOKE_CLOSE, parameters_fully_closed)
+        else {
+            break;
+        };
+        let params_text = &region[..close_rel];
+        out.push((name, params_text));
+        cursor = &after_open[close_rel + INVOKE_CLOSE.len()..];
+    }
+
+    out
+}
+
+fn find_invoke_open_offset(s: &str) -> Option<usize> {
+    let open = "<invoke";
+    let mut search = 0;
+    while let Some(rel) = s[search..].find(open) {
+        let abs = search + rel;
+        if find_named_open(&s[abs..], "invoke").is_some() {
+            return Some(abs);
+        }
+        search = abs + 1;
+    }
+    None
+}
+
+fn iter_tool_call_blocks(text: &str) -> Vec<(usize, &str)> {
+    let mut blocks = Vec::new();
+    let mut abs_base = 0;
+    let mut cursor = text;
+
+    while let Some(open_rel) = cursor.find(TOOL_CALL_OPEN) {
+        let block_start = abs_base + open_rel;
+        let after_open = &cursor[open_rel + TOOL_CALL_OPEN.len()..];
+        let next_open = after_open.find(TOOL_CALL_OPEN).unwrap_or(after_open.len());
+        let region = &after_open[..next_open];
+        let Some(close_rel) = region.rfind(TOOL_CALL_CLOSE) else {
+            break;
+        };
+        let block_end_in_cursor = open_rel + TOOL_CALL_OPEN.len() + close_rel + TOOL_CALL_CLOSE.len();
+        blocks.push((block_start, &cursor[open_rel..block_end_in_cursor]));
+        abs_base += block_end_in_cursor;
+        cursor = &cursor[block_end_in_cursor..];
+    }
+
+    blocks
+}
+
+fn try_parse_invoke_open(buffer: &str) -> Option<(String, usize)> {
+    find_named_open(buffer, "invoke")
+}
+
+fn find_structural_invoke_end(buffer: &str) -> Option<usize> {
+    find_structural_close(buffer, INVOKE_CLOSE, parameters_fully_closed)
+}
+
 impl Default for MinimaxM2Parser {
     fn default() -> Self {
         Self::new()
@@ -399,7 +522,7 @@ impl ToolParser for MinimaxM2Parser {
                 // Between invokes in a wrapper: if the wrapper-end tag arrives before
                 // the next <invoke>, the wrapper is finished — consume it and exit.
                 if let Some(end_pos) = self.buffer.find(self.tool_call_end_token) {
-                    let next_invoke = self.buffer.find("<invoke");
+                    let next_invoke = find_invoke_open_offset(&self.buffer);
                     if next_invoke.is_none_or(|i| end_pos < i) {
                         self.buffer =
                             self.buffer[end_pos + self.tool_call_end_token.len()..].to_string();
@@ -410,15 +533,7 @@ impl ToolParser for MinimaxM2Parser {
                     }
                 }
 
-                // Use regex to extract function name from <invoke name="..."> pattern
-                // Check if we have enough text to match the invoke pattern
-                if let Some(captures) = self.invoke_extractor.captures(&self.buffer) {
-                    let function_name = captures
-                        .get(1)
-                        .map_or("", |m| m.as_str())
-                        .trim()
-                        .to_string();
-
+                if let Some((function_name, after_open)) = try_parse_invoke_open(&self.buffer) {
                     // Forward unknown tool names too — emit a tool_call rather than
                     // leaking the <invoke> markup into assistant text.
                     self.current_function_name.clone_from(&function_name);
@@ -443,14 +558,10 @@ impl ToolParser for MinimaxM2Parser {
                         parameters: String::new(),
                     });
 
-                    // Find the position after the opening invoke tag (after the >)
-                    // We only want to remove up to the opening tag, not the full match
-                    if let Some(pos) = self.buffer.find('>') {
-                        self.buffer = self.buffer[pos + 1..].to_string();
-                    }
+                    self.buffer = self.buffer[after_open..].to_string();
                     continue;
                 }
-                // No complete invoke pattern found yet, wait for more text
+                // No complete invoke open found yet, wait for more text
                 break;
             }
 
@@ -461,8 +572,8 @@ impl ToolParser for MinimaxM2Parser {
                 let parameter_calls = self.parse_and_stream_parameters(&buffer_copy, tools);
                 calls.extend(parameter_calls);
 
-                // Check if tool call is complete (</invoke> found)
-                if let Some(invoke_end) = self.buffer.find(self.invoke_end_token) {
+                // Check if tool call is complete (real </invoke>, not one inside a value)
+                if let Some(invoke_end) = find_structural_invoke_end(&self.buffer) {
                     // Add closing brace to complete the JSON object
                     let tool_id = self.current_tool_id as usize;
                     if tool_id < self.streamed_args_for_tool.len() {
@@ -522,5 +633,31 @@ impl ToolParser for MinimaxM2Parser {
         self.current_parameters.clear();
         self.in_tool_call = false;
         self.function_name_sent = false;
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn parameter_pairs_keep_literal_close_tag() {
+        let pairs = parse_parameter_pairs(
+            r#"<parameter name="content">use </parameter> carefully</parameter>"#,
+        );
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "content");
+        assert_eq!(pairs[0].1, "use </parameter> carefully");
+    }
+
+    #[test]
+    fn invoke_keeps_literal_invoke_close_in_value() {
+        let blocks = iter_invoke_blocks(
+            r#"<invoke name="write"><parameter name="content">text with </invoke> inside</parameter></invoke>"#,
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, "write");
+        let pairs = parse_parameter_pairs(blocks[0].1);
+        assert_eq!(pairs[0].1, "text with </invoke> inside");
     }
 }

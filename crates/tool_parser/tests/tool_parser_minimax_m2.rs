@@ -965,3 +965,59 @@ async fn test_minimax_invalid_json_in_parameters() {
 
     assert_eq!(normal_text, "");
 }
+
+#[tokio::test]
+async fn test_minimax_literal_parameter_close_in_value() {
+    let parser = MinimaxM2Parser::new();
+
+    let input = r#"<minimax:tool_call>
+<invoke name="write">
+<parameter name="content">use </parameter> carefully</parameter>
+</invoke>
+</minimax:tool_call>"#;
+
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(normal_text, "");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "write");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["content"], "use </parameter> carefully");
+}
+
+#[tokio::test]
+async fn test_minimax_literal_invoke_close_in_parameter_value() {
+    let parser = MinimaxM2Parser::new();
+
+    let input = r#"<minimax:tool_call>
+<invoke name="write">
+<parameter name="content">text with </invoke> inside</parameter>
+</invoke>
+</minimax:tool_call>"#;
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "write");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["content"], "text with </invoke> inside");
+}
+
+#[tokio::test]
+async fn test_minimax_literal_close_with_following_parameter() {
+    let parser = MinimaxM2Parser::new();
+
+    let input = r#"<minimax:tool_call>
+<invoke name="write">
+<parameter name="content">see </parameter> tag</parameter>
+<parameter name="path">/tmp/a.txt</parameter>
+</invoke>
+</minimax:tool_call>"#;
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["content"], "see </parameter> tag");
+    assert_eq!(args["path"], "/tmp/a.txt");
+}
