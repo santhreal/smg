@@ -65,14 +65,26 @@ impl PythonicParser {
         }
     }
 
-    /// Extract the first pythonic tool call block and return it along with the
-    /// surrounding "normal" content.
+    /// Extract the first pythonic tool call block and surrounding normal text.
+    /// Span is quote-aware so `]`/`)` inside string args do not truncate.
     fn extract_tool_calls(text: &str) -> Option<(String, String)> {
-        pythonic_block_regex().find(text).map(|mat| {
-            let block = mat.as_str().to_string();
-            let normal = format!("{}{}", &text[..mat.start()], &text[mat.end()..]);
-            (block, normal)
-        })
+        let mut search_from = 0;
+        while let Some(rel) = text[search_from..].find('[') {
+            let start = search_from + rel;
+            let Some(end) = find_matching_bracket(text, start) else {
+                break;
+            };
+            let block = &text[start..=end];
+            if matches!(Self::parse_tool_call_block(block), Ok(ref calls) if !calls.is_empty()) {
+                let normal = format!("{}{}", &text[..start], &text[end + 1..]);
+                return Some((block.to_string(), normal));
+            }
+            search_from = end + 1;
+            if search_from >= text.len() {
+                break;
+            }
+        }
+        None
     }
 
     /// Strip special tokens that Llama models might output
@@ -142,11 +154,11 @@ impl ToolParser for PythonicParser {
 
             // Look for matching closing bracket
             if let Some(end) = find_matching_bracket(&cleaned, start) {
-                // Found complete tool call - extract it and parse using parse_complete
+                // Parse the extracted block directly (not via parse_complete's regex).
                 let call_text = &cleaned[start..=end];
 
-                match self.parse_complete(call_text).await {
-                    Ok((_, calls)) => {
+                match Self::parse_tool_call_block(call_text) {
+                    Ok(calls) => {
                         // Update buffer with remaining text after tool call
                         let remaining_text = &cleaned[end + 1..];
                         self.buffer = remaining_text.to_string();
@@ -220,23 +232,43 @@ impl ToolParser for PythonicParser {
     }
 }
 
-/// Find the matching closing bracket for the opening bracket at start position.
-/// Properly handles nested brackets.
+/// Byte offset of the `]` matching `[` at `start` (a char boundary from `find`).
+/// Ignores brackets inside quoted strings so values like `"a]b"` stay open.
 fn find_matching_bracket(buffer: &str, start: usize) -> Option<usize> {
-    let mut bracket_count = 0;
-    let chars: Vec<char> = buffer.chars().collect();
+    if !buffer.is_char_boundary(start) {
+        return None;
+    }
 
-    for (i, &ch) in chars.iter().enumerate().skip(start) {
-        if ch == '[' {
-            bracket_count += 1;
-        } else if ch == ']' {
-            bracket_count -= 1;
-            if bracket_count == 0 {
-                return Some(i);
+    let mut bracket_count = 0;
+    let mut string_delim: Option<char> = None;
+    let mut escaped = false;
+
+    for (rel, ch) in buffer[start..].char_indices() {
+        let i = start + rel;
+        if let Some(delim) = string_delim {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delim {
+                string_delim = None;
             }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => string_delim = Some(ch),
+            '[' => bracket_count += 1,
+            ']' => {
+                bracket_count -= 1;
+                if bracket_count == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
         }
     }
-    None // No matching bracket found
+    None
 }
 
 // Also used by the Sarashina parser to parse its Python-literal payload;

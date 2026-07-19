@@ -515,3 +515,91 @@ async fn test_detect_and_parse_with_python_start_and_end_token() {
     assert_eq!(args["location"], "Mars");
     assert_eq!(args["unit"], "celsius");
 }
+
+#[tokio::test]
+async fn test_parse_streaming_multibyte_argument() {
+    let mut parser = PythonicParser::new();
+    let tools = create_test_tools();
+
+    // "São Paulo" contains a 2-byte 'ã'; the matched bracket position must be a
+    // byte offset, otherwise the trailing ']' is sliced off and parsing fails.
+    let text = r#"[get_weather(city="São Paulo")]"#;
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
+
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].name.as_deref(), Some("get_weather"));
+    let args: serde_json::Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
+    assert_eq!(args["city"], "São Paulo");
+}
+
+#[tokio::test]
+async fn test_parse_streaming_closing_bracket_inside_string() {
+    let mut parser = PythonicParser::new();
+    let tools = create_test_tools();
+
+    // Unbalanced `)]` inside the quoted value must not end the call list early.
+    let text = r#"[search(query="array[0) lookup]")]"#;
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
+
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].name.as_deref(), Some("search"));
+    let args: serde_json::Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
+    assert_eq!(args["query"], "array[0) lookup]");
+}
+
+#[tokio::test]
+async fn test_parse_streaming_escaped_quote_with_bracket() {
+    let mut parser = PythonicParser::new();
+    let tools = create_test_tools();
+
+    let text = r#"[search(query="he said \"]\" loudly")]"#;
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
+
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].name.as_deref(), Some("search"));
+    let args: serde_json::Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
+    assert_eq!(args["query"], r#"he said "]" loudly"#);
+}
+
+#[tokio::test]
+async fn test_parse_streaming_multibyte_partial_then_complete() {
+    let mut parser = PythonicParser::new();
+    let tools = create_test_tools();
+
+    let text1 = r#"[get_weather(city="São "#;
+    let result1 = parser.parse_incremental(text1, &tools).await.unwrap();
+    assert!(result1.calls.is_empty());
+
+    let text2 = r#"Paulo")]"#;
+    let result2 = parser.parse_incremental(text2, &tools).await.unwrap();
+    assert_eq!(result2.calls.len(), 1);
+    assert_eq!(result2.calls[0].name.as_deref(), Some("get_weather"));
+    let args: serde_json::Value = serde_json::from_str(&result2.calls[0].parameters).unwrap();
+    assert_eq!(args["city"], "São Paulo");
+}
+
+#[tokio::test]
+async fn test_parse_complete_multibyte_argument() {
+    let parser = PythonicParser::new();
+
+    let input = r#"[get_weather(city="São Paulo")]"#;
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "get_weather");
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["city"], "São Paulo");
+}
+
+#[tokio::test]
+async fn test_parse_complete_unbalanced_parens_inside_string() {
+    let parser = PythonicParser::new();
+
+    let input = r#"[search(query="array[0) lookup]")]"#;
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "search");
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["query"], "array[0) lookup]");
+}
