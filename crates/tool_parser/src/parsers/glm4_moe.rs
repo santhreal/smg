@@ -223,15 +223,70 @@ fn first_tool_call_spans(text: &str) -> Vec<(usize, usize)> {
         let after_inner = &text[inner_start..];
         let next_open = after_inner.find(OPEN).unwrap_or(after_inner.len());
         let region = &after_inner[..next_open];
-        let Some(close_rel) = region.rfind(CLOSE) else {
+
+        // Prefer the last closer that yields a structurally complete arg section so an
+        // embedded "</tool_call>" inside an open <arg_value> does not finalize early
+        // during streaming (when the real closer has not arrived yet).
+        let mut chosen_end: Option<usize> = None;
+        let mut search_from = 0usize;
+        while let Some(close_rel) = region[search_from..].find(CLOSE) {
+            let abs_close = search_from + close_rel;
+            let block_end = inner_start + abs_close + CLOSE.len();
+            let block = &text[block_start..block_end];
+            if tool_call_block_args_complete(block) {
+                chosen_end = Some(block_end);
+            }
+            search_from = abs_close + CLOSE.len();
+        }
+        let Some(block_end) = chosen_end else {
             break;
         };
-        let block_end = inner_start + close_rel + CLOSE.len();
         spans.push((block_start, block_end));
         offset = block_end;
     }
 
     spans
+}
+
+fn tool_call_block_args_complete(block: &str) -> bool {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let Some(inner) = block.strip_prefix(OPEN).and_then(|s| s.strip_suffix(CLOSE)) else {
+        return false;
+    };
+    let args_text = if let Some(nl) = inner.find('\n') {
+        &inner[nl + 1..]
+    } else if let Some(key_pos) = inner.find(ARG_KEY_OPEN) {
+        &inner[key_pos..]
+    } else {
+        return true; // parameterless name-only body
+    };
+    arg_section_is_complete(args_text)
+}
+
+fn arg_section_is_complete(args_text: &str) -> bool {
+    let mut cursor = args_text;
+    while let Some(key_open_rel) = cursor.find(ARG_KEY_OPEN) {
+        let after_key_open = &cursor[key_open_rel + ARG_KEY_OPEN.len()..];
+        let Some(key_close_rel) = after_key_open.find(ARG_KEY_CLOSE) else {
+            return false;
+        };
+        cursor = &after_key_open[key_close_rel + ARG_KEY_CLOSE.len()..];
+
+        let Some(val_open_rel) = cursor.find(ARG_VAL_OPEN) else {
+            return false;
+        };
+        let after_val_open = &cursor[val_open_rel + ARG_VAL_OPEN.len()..];
+        let next_key = after_val_open
+            .find(ARG_KEY_OPEN)
+            .unwrap_or(after_val_open.len());
+        let value_region = &after_val_open[..next_key];
+        let Some(val_close_rel) = value_region.rfind(ARG_VAL_CLOSE) else {
+            return false;
+        };
+        cursor = &after_val_open[val_close_rel + ARG_VAL_CLOSE.len()..];
+    }
+    !cursor.contains(ARG_VAL_OPEN)
 }
 
 impl Glm4MoeParser {

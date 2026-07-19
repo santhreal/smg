@@ -227,3 +227,33 @@ async fn test_glm47_arg_value_with_embedded_close_tag() {
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "has </arg_value> inside");
 }
+
+#[tokio::test]
+async fn test_streaming_embedded_tool_call_close_waits_for_real_closer() {
+    use common::create_test_tools;
+
+    let mut parser = Glm4MoeParser::glm45();
+    let tools = create_test_tools();
+    // Split after the embedded </tool_call> so incomplete buffering would historically
+    // finalize early and drop the rest of the value.
+    let chunks = [
+        "<tool_call>translate\n<arg_key>text</arg_key>\n<arg_value>has </tool_call>",
+        " inside</arg_value>\n</tool_call>",
+    ];
+
+    let mut names = Vec::new();
+    let mut params = String::new();
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                names.push(name);
+            }
+            params.push_str(&call.parameters);
+        }
+    }
+
+    assert_eq!(names, vec!["translate".to_string()]);
+    let args: serde_json::Value = serde_json::from_str(&params).unwrap();
+    assert_eq!(args["text"], "has </tool_call> inside");
+}
