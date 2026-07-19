@@ -190,3 +190,40 @@ async fn test_tool_call_close_tag_inside_argument_value() {
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "has </tool_call> inside");
 }
+
+#[tokio::test]
+async fn test_glm47_multiline_value_keeps_name() {
+    let parser = Glm4MoeParser::glm47();
+    let input = "<tool_call>process<arg_key>data</arg_key><arg_value>line1\nline2</arg_value></tool_call>";
+
+    let (_, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "process");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["data"], "line1\nline2");
+}
+
+#[tokio::test]
+async fn test_glm47_parameterless_call() {
+    let parser = Glm4MoeParser::glm47();
+    let input = "<tool_call>ping</tool_call>";
+
+    let (_, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "ping");
+    assert_eq!(tools[0].function.arguments, "{}");
+}
+
+#[tokio::test]
+async fn test_glm47_arg_value_with_embedded_close_tag() {
+    let parser = Glm4MoeParser::glm47();
+    let input = "<tool_call>echo<arg_key>text</arg_key><arg_value>has </arg_value> inside</arg_value></tool_call>";
+
+    let (_, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "echo");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["text"], "has </arg_value> inside");
+}

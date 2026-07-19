@@ -21,7 +21,21 @@ use crate::{
 /// - XML-style tags for tool calls
 /// - Key-value pairs for arguments
 /// - Support for multiple sequential tool calls
+///
+/// Close tags that appear literally inside argument values are kept by matching the
+/// real closer against the next sibling open (`<arg_key>` / `<tool_call>`). An unescaped
+/// open `<tool_call>` inside a value is not supported and may truncate the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlmFormat {
+    /// Name ends at the first newline after `<tool_call>`.
+    Glm45,
+    /// Name is the whitespace-trimmed token before the first `<arg_key>` (or whole body if none).
+    Glm47,
+}
+
 pub struct Glm4MoeParser {
+    format: GlmFormat,
+
     /// Buffer for accumulating incomplete patterns across chunks
     buffer: String,
 
@@ -40,8 +54,9 @@ pub struct Glm4MoeParser {
 }
 
 impl Glm4MoeParser {
-    fn new() -> Self {
+    fn new(format: GlmFormat) -> Self {
         Self {
+            format,
             buffer: String::new(),
             prev_tool_call_arr: Vec::new(),
             current_tool_id: -1,
@@ -53,12 +68,12 @@ impl Glm4MoeParser {
 
     /// Create a new GLM-4.5/4.6 MoE parser (with newline-based format)
     pub fn glm45() -> Self {
-        Self::new()
+        Self::new(GlmFormat::Glm45)
     }
 
     /// Create a new GLM-4.7 MoE parser (with whitespace-based format)
     pub fn glm47() -> Self {
-        Self::new()
+        Self::new(GlmFormat::Glm47)
     }
 
     /// Parse arguments, coercing each value by its declared schema type and
@@ -85,18 +100,32 @@ impl Glm4MoeParser {
         let inner = block
             .strip_prefix(self.bot_token)?
             .strip_suffix(self.eot_token)?;
-        if let Some(nl) = inner.find('\n') {
-            let name = inner[..nl].trim();
-            if !name.is_empty() {
-                return Some((name.to_string(), inner[nl + 1..].trim_start()));
+        match self.format {
+            GlmFormat::Glm45 => {
+                let nl = inner.find('\n')?;
+                let name = inner[..nl].trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some((name.to_string(), inner[nl + 1..].trim_start()))
+            }
+            GlmFormat::Glm47 => {
+                let trimmed = inner.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if let Some(key_pos) = trimmed.find("<arg_key>") {
+                    let name = trimmed[..key_pos].trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some((name.to_string(), trimmed[key_pos..].trim_start()))
+                } else {
+                    // Parameterless call: whole body is the function name.
+                    Some((trimmed.to_string(), ""))
+                }
             }
         }
-        let key_pos = inner.find("<arg_key>")?;
-        let name = inner[..key_pos].trim();
-        if name.is_empty() {
-            return None;
-        }
-        Some((name.to_string(), inner[key_pos..].trim_start()))
     }
 
     /// Parse a single tool call block
