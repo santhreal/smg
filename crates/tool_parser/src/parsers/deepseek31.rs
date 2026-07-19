@@ -10,6 +10,13 @@ use crate::{
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
+const TOOL_CALLS_BEGIN: &str = "<｜tool▁calls▁begin｜>";
+const TOOL_CALL_BEGIN: &str = "<｜tool▁call▁begin｜>";
+const TOOL_SEP: &str = "<｜tool▁sep｜>";
+const TOOL_CALL_END: &str = "<｜tool▁call▁end｜>";
+const TOOL_CALLS_END: &str = "<｜tool▁calls▁end｜>";
+const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
+
 /// DeepSeek V3.1 format parser for tool calls
 ///
 /// Handles the DeepSeek V3.1 format:
@@ -23,14 +30,8 @@ use crate::{
 ///
 /// Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3.1
 pub struct DeepSeek31Parser {
-    /// Regex for extracting complete tool call blocks
-    tool_call_extractor: Regex,
-    /// Regex for extracting function name and arguments from a complete block
-    func_detail_extractor: Regex,
     /// Regex for matching partial tool calls during streaming
     partial_tool_call_regex: Regex,
-    /// Regex for removing completed tool calls from buffer
-    tool_call_end_pattern: Regex,
 
     /// Buffer for accumulating incomplete patterns across chunks
     buffer: String,
@@ -55,25 +56,12 @@ impl DeepSeek31Parser {
         reason = "regex patterns are compile-time string literals"
     )]
     pub fn new() -> Self {
-        let tool_call_extractor = Regex::new(r"(?s)<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>")
-            .expect("Valid regex pattern");
-
-        let func_detail_extractor =
-            Regex::new(r"(?s)<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)<｜tool▁call▁end｜>")
-                .expect("Valid regex pattern");
-
         let partial_tool_call_regex =
             Regex::new(r"(?s)<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)")
                 .expect("Valid regex pattern");
 
-        let tool_call_end_pattern = Regex::new(r"(?s)<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>")
-            .expect("Valid regex pattern");
-
         Self {
-            tool_call_extractor,
-            func_detail_extractor,
             partial_tool_call_regex,
-            tool_call_end_pattern,
             buffer: String::new(),
             prev_tool_call_arr: Vec::new(),
             current_tool_id: -1,
@@ -82,20 +70,71 @@ impl DeepSeek31Parser {
         }
     }
 
-    /// Parse a single complete tool call block
-    fn parse_tool_call(&self, block: &str) -> ParserResult<ToolCall> {
-        let captures = self.func_detail_extractor.captures(block).ok_or_else(|| {
-            ParserError::ParsingFailed("Failed to match tool call pattern".to_string())
-        })?;
+    /// Byte offset of `needle` in `s`, ignoring occurrences inside JSON strings.
+    fn find_token_outside_json_strings(s: &str, needle: &str) -> Option<usize> {
+        let mut in_string = false;
+        let mut escape = false;
+        let bytes = s.as_bytes();
+        let needle_bytes = needle.as_bytes();
+        let mut i = 0;
+        while i + needle_bytes.len() <= bytes.len() {
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            let b = bytes[i];
+            if in_string {
+                if b == b'\\' {
+                    escape = true;
+                    i += 1;
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                in_string = true;
+                i += 1;
+                continue;
+            }
+            if bytes[i..].starts_with(needle_bytes) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
 
-        let func_name = captures.get(1).map_or("", |m| m.as_str()).trim();
+    /// Parse one complete tool call starting at `start` (must point at TOOL_CALL_BEGIN).
+    /// Returns the tool call and the byte index just past TOOL_CALL_END.
+    fn parse_tool_call_at(text: &str, start: usize) -> ParserResult<(ToolCall, usize)> {
+        let after_begin = start + TOOL_CALL_BEGIN.len();
+        let Some(sep_rel) = text[after_begin..].find(TOOL_SEP) else {
+            return Err(ParserError::ParsingFailed(
+                "Failed to match tool call pattern".to_string(),
+            ));
+        };
+        let func_name = text[after_begin..after_begin + sep_rel].trim();
         if func_name.is_empty() {
             return Err(ParserError::ParsingFailed(
                 "Empty function name".to_string(),
             ));
         }
 
-        let json_args = captures.get(2).map_or("{}", |m| m.as_str()).trim();
+        let args_start = after_begin + sep_rel + TOOL_SEP.len();
+        let Some(end_rel) =
+            Self::find_token_outside_json_strings(&text[args_start..], TOOL_CALL_END)
+        else {
+            return Err(ParserError::ParsingFailed(
+                "Failed to match tool call pattern".to_string(),
+            ));
+        };
+        let json_args = text[args_start..args_start + end_rel].trim();
+        let end_pos = args_start + end_rel + TOOL_CALL_END.len();
 
         let value = serde_json::from_str::<Value>(json_args)
             .map_err(|e| ParserError::ParsingFailed(format!("Invalid JSON: {e}")))?;
@@ -109,12 +148,25 @@ impl DeepSeek31Parser {
         let arguments =
             serde_json::to_string(&args).map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
-        Ok(ToolCall {
-            function: FunctionCall {
-                name: func_name.to_string(),
-                arguments,
+        Ok((
+            ToolCall {
+                function: FunctionCall {
+                    name: func_name.to_string(),
+                    arguments,
+                },
             },
-        })
+            end_pos,
+        ))
+    }
+
+    /// Advance past TOOL_CALL_END for the current call, ignoring markers inside JSON strings.
+    fn end_of_current_tool_call(text: &str) -> Option<usize> {
+        let begin = text.find(TOOL_CALL_BEGIN)?;
+        let after_begin = begin + TOOL_CALL_BEGIN.len();
+        let sep_rel = text[after_begin..].find(TOOL_SEP)?;
+        let args_start = after_begin + sep_rel + TOOL_SEP.len();
+        let end_rel = Self::find_token_outside_json_strings(&text[args_start..], TOOL_CALL_END)?;
+        Some(args_start + end_rel + TOOL_CALL_END.len())
     }
 }
 
@@ -132,17 +184,22 @@ impl ToolParser for DeepSeek31Parser {
         }
 
         let idx = text
-            .find("<｜tool▁calls▁begin｜>")
+            .find(TOOL_CALLS_BEGIN)
             .ok_or_else(|| ParserError::ParsingFailed("tool call marker not found".to_string()))?;
         let normal_text = text[..idx].to_string();
 
         let mut tools = Vec::new();
-        for mat in self.tool_call_extractor.find_iter(text) {
-            match self.parse_tool_call(mat.as_str()) {
-                Ok(tool) => tools.push(tool),
+        let mut pos = 0;
+        while let Some(rel) = text[pos..].find(TOOL_CALL_BEGIN) {
+            let start = pos + rel;
+            match Self::parse_tool_call_at(text, start) {
+                Ok((tool, end)) => {
+                    tools.push(tool);
+                    pos = end;
+                }
                 Err(e) => {
                     tracing::debug!("Failed to parse tool call: {}", e);
-                    continue;
+                    pos = start + TOOL_CALL_BEGIN.len();
                 }
             }
         }
@@ -163,15 +220,11 @@ impl ToolParser for DeepSeek31Parser {
         let current_text = self.buffer.clone();
 
         let has_tool_call =
-            self.has_tool_markers(&current_text) || current_text.contains("<｜tool▁call▁begin｜>");
+            self.has_tool_markers(&current_text) || current_text.contains(TOOL_CALL_BEGIN);
 
         if !has_tool_call {
             let mut normal_text = std::mem::take(&mut self.buffer);
-            for end_token in [
-                "<｜tool▁calls▁end｜>",
-                "<｜tool▁call▁end｜>",
-                "<｜end▁of▁sentence｜>",
-            ] {
+            for end_token in [TOOL_CALLS_END, TOOL_CALL_END, EOS_TOKEN] {
                 normal_text = normal_text.replace(end_token, "");
             }
             return Ok(StreamingParseResult {
@@ -222,11 +275,7 @@ impl ToolParser for DeepSeek31Parser {
                 // JSON bytes. The partial_tool_call_regex group 2 greedily captures
                 // everything after <｜tool▁sep｜>, including any trailing end tokens.
                 // Use an iterative loop so stacked markers in any order are all removed.
-                const END_MARKERS: [&str; 3] = [
-                    "<｜end▁of▁sentence｜>",
-                    "<｜tool▁calls▁end｜>",
-                    "<｜tool▁call▁end｜>",
-                ];
+                const END_MARKERS: [&str; 3] = [EOS_TOKEN, TOOL_CALLS_END, TOOL_CALL_END];
                 let mut func_args_clean = func_args_raw.trim_end();
                 loop {
                     let before = func_args_clean;
@@ -263,8 +312,8 @@ impl ToolParser for DeepSeek31Parser {
                         }
                     }
 
-                    if let Some(mat) = self.tool_call_end_pattern.find(&current_text) {
-                        self.buffer = current_text[mat.end()..].to_string();
+                    if let Some(end) = Self::end_of_current_tool_call(&current_text) {
+                        self.buffer = current_text[end..].to_string();
                     } else {
                         self.buffer.clear();
                     }
@@ -305,7 +354,7 @@ impl ToolParser for DeepSeek31Parser {
     }
 
     fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<｜tool▁calls▁begin｜>")
+        text.contains(TOOL_CALLS_BEGIN)
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {

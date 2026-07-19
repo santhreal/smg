@@ -302,3 +302,61 @@ async fn test_deepseek31_factory_registration() {
         .registry()
         .has_parser_for_model("deepseek-ai/DeepSeek-V3-0324"));
 }
+
+#[tokio::test]
+async fn test_deepseek31_tool_call_end_marker_inside_json_string() {
+    let parser = DeepSeek31Parser::new();
+
+    let input = concat!(
+        "<｜tool▁calls▁begin｜>",
+        "<｜tool▁call▁begin｜>echo<｜tool▁sep｜>",
+        r#"{"text": "say <｜tool▁call▁end｜> please"}"#,
+        "<｜tool▁call▁end｜>",
+        "<｜tool▁calls▁end｜>",
+    );
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(
+        tools.len(),
+        1,
+        "tool call must not be dropped when end marker appears in JSON string"
+    );
+    assert_eq!(tools[0].function.name, "echo");
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["text"], "say <｜tool▁call▁end｜> please");
+}
+
+#[tokio::test]
+async fn test_deepseek31_streaming_end_marker_inside_json_string() {
+    let tools = create_test_tools();
+    let mut parser = DeepSeek31Parser::new();
+
+    // `echo` is not in create_test_tools(); use `search` which is.
+    let chunks = vec![
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>search<｜tool▁sep｜>",
+        r#"{"query": "say <｜tool▁call▁end｜> please"}"#,
+        "<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    ];
+
+    let mut found_name = false;
+    let mut collected_args = String::new();
+    for chunk in chunks {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if let Some(name) = call.name {
+                assert_eq!(name, "search");
+                found_name = true;
+            }
+            collected_args.push_str(&call.parameters);
+        }
+    }
+
+    assert!(found_name);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&collected_args).expect("streamed args should be valid JSON");
+    assert_eq!(parsed["query"], "say <｜tool▁call▁end｜> please");
+    assert!(
+        !collected_args.contains("<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
+        "trailing structural end markers must not leak into streamed args"
+    );
+}
