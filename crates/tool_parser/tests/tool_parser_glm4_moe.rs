@@ -166,3 +166,27 @@ async fn test_glm4_nested_json_in_arg_values() {
     assert!(args["data"].is_object());
     assert!(args["list"].is_array());
 }
+
+#[tokio::test]
+async fn test_arg_value_with_embedded_close_tag() {
+    let parser = Glm4MoeParser::glm45();
+    let input = "<tool_call>echo\n<arg_key>text</arg_key>\n<arg_value>has </arg_value> inside</arg_value>\n</tool_call>";
+
+    let (_, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["text"], "has </arg_value> inside");
+}
+
+#[tokio::test]
+async fn test_tool_call_close_tag_inside_argument_value() {
+    let parser = Glm4MoeParser::glm45();
+    let input = "<tool_call>echo\n<arg_key>text</arg_key>\n<arg_value>has </tool_call> inside</arg_value>\n</tool_call>";
+
+    let (_, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["text"], "has </tool_call> inside");
+}
