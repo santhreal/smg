@@ -27,9 +27,6 @@ pub struct Glm4MoeParser {
     tool_call_extractor: Regex,
     /// Regex for extracting function details
     func_detail_extractor: Regex,
-    /// Regex for extracting argument key-value pairs
-    arg_extractor: Regex,
-
     /// Buffer for accumulating incomplete patterns across chunks
     buffer: String,
 
@@ -65,13 +62,9 @@ impl Glm4MoeParser {
 
         let func_detail_extractor = Regex::new(func_detail_pattern).expect("Valid regex pattern");
 
-        let arg_pattern = r"(?s)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>";
-        let arg_extractor = Regex::new(arg_pattern).expect("Valid regex pattern");
-
         Self {
             tool_call_extractor,
             func_detail_extractor,
-            arg_extractor,
             buffer: String::new(),
             prev_tool_call_arr: Vec::new(),
             current_tool_id: -1,
@@ -99,16 +92,33 @@ impl Glm4MoeParser {
         param_types: &HashMap<String, String>,
     ) -> serde_json::Map<String, Value> {
         let mut arguments = serde_json::Map::new();
-
-        for capture in self.arg_extractor.captures_iter(args_text) {
-            let key = capture.get(1).map_or("", |m| m.as_str()).trim();
-            let value_str = capture.get(2).map_or("", |m| m.as_str()).trim();
-
-            let value =
-                helpers::coerce_by_schema_type(value_str, param_types.get(key).map(String::as_str))
-                    .unwrap_or_else(|| infer_value(value_str));
-
+        // Prefer last </arg_value> before next <arg_key> so literals inside values survive.
+        let mut rest = args_text;
+        while let Some(key_rel) = rest.find("<arg_key>") {
+            rest = &rest[key_rel + "<arg_key>".len()..];
+            let Some(key_end) = rest.find("</arg_key>") else {
+                break;
+            };
+            let key = rest[..key_end].trim();
+            rest = &rest[key_end + "</arg_key>".len()..];
+            let trimmed = rest.trim_start();
+            if !trimmed.starts_with("<arg_value>") {
+                continue;
+            }
+            rest = &trimmed["<arg_value>".len()..];
+            let next_key = rest.find("<arg_key>").unwrap_or(rest.len());
+            let search = &rest[..next_key];
+            let Some(close_rel) = search.rfind("</arg_value>") else {
+                break;
+            };
+            let value_str = search[..close_rel].trim();
+            let value = helpers::coerce_by_schema_type(
+                value_str,
+                param_types.get(key).map(String::as_str),
+            )
+            .unwrap_or_else(|| infer_value(value_str));
             arguments.insert(key.to_string(), value);
+            rest = &rest[close_rel + "</arg_value>".len()..];
         }
 
         arguments

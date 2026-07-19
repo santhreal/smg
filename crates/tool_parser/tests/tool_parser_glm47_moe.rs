@@ -134,6 +134,20 @@ async fn test_python_literals() {
 }
 
 #[tokio::test]
+async fn test_glm47_arg_value_close_tag_inside_value() {
+    let parser = Glm4MoeParser::glm47();
+
+    let input = r"<tool_call>echo<arg_key>text</arg_key><arg_value>use </arg_value> in docs</arg_value></tool_call>";
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "echo");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["text"], "use </arg_value> in docs");
+}
+
+#[tokio::test]
 async fn test_glm47_nested_json_in_arg_values() {
     let parser = Glm4MoeParser::glm47();
 
@@ -146,3 +160,4 @@ async fn test_glm47_nested_json_in_arg_values() {
     assert!(args["data"].is_object());
     assert!(args["list"].is_array());
 }
+
