@@ -11,6 +11,15 @@ use crate::{
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
+/// Which GLM MoE wire format to use for name extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlmFormat {
+    /// Name ends at the first newline after `<tool_call>`.
+    Glm45,
+    /// Name is the whitespace-trimmed token before the first `<arg_key>` (or whole body if none).
+    Glm47,
+}
+
 /// GLM-4 MoE format parser for tool calls
 ///
 /// Handles both GLM-4 MoE and GLM-4.7 MoE formats:
@@ -25,14 +34,6 @@ use crate::{
 /// Close tags that appear literally inside argument values are kept by matching the
 /// real closer against the next sibling open (`<arg_key>` / `<tool_call>`). An unescaped
 /// open `<tool_call>` inside a value is not supported and may truncate the block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlmFormat {
-    /// Name ends at the first newline after `<tool_call>`.
-    Glm45,
-    /// Name is the whitespace-trimmed token before the first `<arg_key>` (or whole body if none).
-    Glm47,
-}
-
 pub struct Glm4MoeParser {
     format: GlmFormat,
 
