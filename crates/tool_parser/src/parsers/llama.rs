@@ -93,19 +93,52 @@ impl LlamaParser {
         }
     }
 
+    /// Split on `;` only outside JSON strings so values like `"a;b"` stay intact.
+    fn split_semicolon_separated(content: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut in_string = false;
+        let mut escape = false;
+
+        for (i, b) in content.bytes().enumerate() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if in_string {
+                if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b';' => {
+                    let part = content[start..i].trim();
+                    if !part.is_empty() {
+                        parts.push(part);
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        let part = content[start..].trim();
+        if !part.is_empty() {
+            parts.push(part);
+        }
+        parts
+    }
+
     /// Parse semicolon-separated JSON objects
     fn parse_semicolon_separated(content: &str) -> ParserResult<Vec<ToolCall>> {
         let mut all_tools = Vec::new();
 
-        // Split by semicolon and parse each JSON object
-        for part in content.split(';') {
-            let trimmed = part.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // Try to parse this part as a single JSON object
-            match serde_json::from_str::<Value>(trimmed) {
+        for part in Self::split_semicolon_separated(content) {
+            match serde_json::from_str::<Value>(part) {
                 Ok(value) => {
                     if let Some(tool) = Self::parse_single_object(&value)? {
                         all_tools.push(tool);

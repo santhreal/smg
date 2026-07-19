@@ -34,6 +34,37 @@ async fn test_llama_with_semicolon_separation() {
 }
 
 #[tokio::test]
+async fn test_llama_semicolon_inside_string_parameter() {
+    let parser = LlamaParser::new();
+
+    let input = r#"<|python_tag|>{"name": "run", "parameters": {"code": "print(1); print(2)"}}"#;
+
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "run");
+    assert_eq!(normal_text, "");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["code"], "print(1); print(2)");
+}
+
+#[tokio::test]
+async fn test_llama_semicolon_separator_with_semicolon_in_string() {
+    let parser = LlamaParser::new();
+
+    let input = r#"<|python_tag|>{"name": "run", "parameters": {"code": "a;b"}};{"name": "ping", "parameters": {}}"#;
+
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].function.name, "run");
+    assert_eq!(tools[1].function.name, "ping");
+    assert_eq!(normal_text, "");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["code"], "a;b");
+}
+
+#[tokio::test]
 async fn test_llama_no_tool_calls() {
     let parser = LlamaParser::new();
 
