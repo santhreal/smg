@@ -166,3 +166,17 @@ async fn test_glm4_nested_json_in_arg_values() {
     assert!(args["data"].is_object());
     assert!(args["list"].is_array());
 }
+
+#[tokio::test]
+async fn test_glm45_prose_mentions_tool_call_before_real_block() {
+    let parser = Glm4MoeParser::glm45();
+    let input = r#"Explain the <tool_call> XML tag.
+<tool_call>search
+<arg_key>q</arg_key>
+<arg_value>x</arg_value>
+</tool_call>"#;
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "search");
+    assert_eq!(normal_text, "Explain the <tool_call> XML tag.\n");
+}

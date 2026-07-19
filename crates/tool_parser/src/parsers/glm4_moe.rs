@@ -59,8 +59,8 @@ impl Glm4MoeParser {
         reason = "regex patterns are compile-time string literals"
     )]
     pub(crate) fn new(func_detail_pattern: &str) -> Self {
-        // Use (?s) flag for DOTALL mode to handle newlines
-        let tool_call_pattern = r"(?s)<tool_call>.*?</tool_call>";
+        // Name must follow <tool_call> immediately so prose mentions cannot swallow real blocks.
+        let tool_call_pattern = r"(?s)<tool_call>[^\n<\s]+.*?</tool_call>";
         let tool_call_extractor = Regex::new(tool_call_pattern).expect("Valid regex pattern");
 
         let func_detail_extractor = Regex::new(func_detail_pattern).expect("Valid regex pattern");
@@ -170,12 +170,11 @@ impl Glm4MoeParser {
             return Ok((text.to_string(), vec![]));
         }
 
-        // Find where tool calls begin
-        // Safe: has_tool_markers() already confirmed the marker exists
-        let idx = text
-            .find("<tool_call>")
-            .ok_or_else(|| ParserError::ParsingFailed("tool call marker not found".to_string()))?;
-        let normal_text = text[..idx].to_string();
+        // Slice normal text at the first complete block, not a prose mention.
+        let Some(first) = self.tool_call_extractor.find(text) else {
+            return Ok((text.to_string(), vec![]));
+        };
+        let normal_text = text[..first.start()].to_string();
 
         let parsed = self.parse_tool_calls_from_text(text, tools);
 
