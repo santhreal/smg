@@ -153,8 +153,16 @@ That's all!"#;
     let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1); // Should extract the valid tool
     assert_eq!(tools[0].function.name, "valid_tool");
-    // Normal text should contain text before the first tool call
-    assert_eq!(normal_text, "Let me help you with that.\n");
+    assert_eq!(
+        normal_text,
+        r#"Let me help you with that.
+
+And here's another one:
+<tool_call>
+{"name": "invalid_tool", "arguments": malformed}
+</tool_call>
+That's all!"#
+    );
 }
 
 #[tokio::test]

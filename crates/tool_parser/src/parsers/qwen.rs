@@ -119,28 +119,31 @@ impl ToolParser for QwenParser {
             return Ok((text.to_string(), vec![]));
         }
 
-        // Find where the first tool call begins
-        // Safe: has_tool_markers() already confirmed the marker exists
-        let idx = text
-            .find("<tool_call>")
-            .ok_or_else(|| ParserError::ParsingFailed("tool_call marker not found".to_string()))?;
-        let normal_text = text[..idx].to_string();
-
         // Extract tool calls
         let mut tools = Vec::new();
+        let mut normal_text = String::new();
+        let mut text_start = 0;
         for captures in self.extractor.captures_iter(text) {
-            if let Some(json_str) = captures.get(1) {
-                let parsed = serde_json::from_str::<Value>(json_str.as_str().trim())
-                    .map_err(|e| ParserError::ParsingFailed(e.to_string()))
-                    .and_then(|v| Self::parse_single_object(&v));
+            let Some(tool_call) = captures.get(0) else {
+                continue;
+            };
+            let Some(json_str) = captures.get(1) else {
+                continue;
+            };
 
-                match parsed {
-                    Ok(Some(tool)) => tools.push(tool),
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::debug!("Failed to parse tool call: {:?}", e);
-                        continue;
-                    }
+            let parsed = serde_json::from_str::<Value>(json_str.as_str().trim())
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))
+                .and_then(|v| Self::parse_single_object(&v));
+
+            match parsed {
+                Ok(Some(tool)) => {
+                    normal_text.push_str(&text[text_start..tool_call.start()]);
+                    text_start = tool_call.end();
+                    tools.push(tool);
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::debug!("Failed to parse tool call: {:?}", e);
                 }
             }
         }
@@ -149,6 +152,8 @@ impl ToolParser for QwenParser {
         if tools.is_empty() {
             return Ok((text.to_string(), vec![]));
         }
+
+        normal_text.push_str(&text[text_start..]);
 
         Ok((normal_text, tools))
     }
