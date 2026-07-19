@@ -109,8 +109,7 @@ impl DeepSeek31Parser {
         None
     }
 
-    /// Parse one complete tool call starting at `start` (must point at TOOL_CALL_BEGIN).
-    /// Returns the tool call and the byte index just past TOOL_CALL_END.
+    /// Parse one complete tool call at `start` (TOOL_CALL_BEGIN); returns call and index past end.
     fn parse_tool_call_at(text: &str, start: usize) -> ParserResult<(ToolCall, usize)> {
         let after_begin = start + TOOL_CALL_BEGIN.len();
         let Some(sep_rel) = text[after_begin..].find(TOOL_SEP) else {
